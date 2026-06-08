@@ -1,0 +1,16 @@
+[project]
+name = "tokenly-app"
+version = "0.1.0"
+description = "Demo app for tokenly-auth"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "sqlmodel",
+    "python-jose[cryptography]",
+    "passlib[bcrypt]",
+    "python-multipart",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
