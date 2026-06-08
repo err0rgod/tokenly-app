@@ -4,8 +4,7 @@ from tokenly.database import DatabaseManager
 db_manager = DatabaseManager("sqlite:///./tokenly.db")
 
 def init_db():
-    db_manager.create_tables()
+    db_manager.init_db()
 
 def get_db():
-    with db_manager.get_session() as session:
-        yield session
+    yield from db_manager.get_session()

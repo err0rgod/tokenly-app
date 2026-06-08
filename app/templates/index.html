@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tokenly Demo</title>
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; line-height: 1.6; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; }
+        input { width: 100%; padding: 8px; box-sizing: border-box; }
+        button { padding: 10px 15px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; }
+        .hidden { display: none; }
+        #message { margin-top: 20px; padding: 10px; border-radius: 4px; }
+        .success { background: #d4edda; color: #155724; }
+        .error { background: #f8d7da; color: #721c24; }
+    </style>
+</head>
+<body>
+    <h1>Tokenly Demo App</h1>
+    
+    <div id="auth-section">
+        <div id="signup-form">
+            <h2>Signup</h2>
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" id="signup-username">
+            </div>
+            <div class="form-group">
+                <label>Email</label>
+                <input type="email" id="signup-email">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="signup-password">
+            </div>
+            <button onclick="signup()">Sign Up</button>
+            <p>Already have an account? <a href="#" onclick="toggleForms()">Login</a></p>
+        </div>
+
+        <div id="login-form" class="hidden">
+            <h2>Login</h2>
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" id="login-username">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="login-password">
+            </div>
+            <button onclick="login()">Login</button>
+            <p>Don't have an account? <a href="#" onclick="toggleForms()">Sign Up</a></p>
+        </div>
+    </div>
+
+    <div id="user-section" class="hidden">
+        <h2>Welcome, <span id="display-username"></span></h2>
+        <p>User ID: <span id="display-userid"></span></p>
+        <button onclick="getMe()">Get My Info</button>
+        <button onclick="refreshToken()">Refresh Token</button>
+        <button onclick="logout()" style="background: #dc3545;">Logout</button>
+    </div>
+
+    <div id="message" class="hidden"></div>
+
+    <script>
+        let accessToken = '';
+        let refreshTkn = '';
+
+        function toggleForms() {
+            document.getElementById('signup-form').classList.toggle('hidden');
+            document.getElementById('login-form').classList.toggle('hidden');
+        }
+
+        function showMessage(text, type) {
+            const msg = document.getElementById('message');
+            msg.innerText = text;
+            msg.className = type;
+            msg.classList.remove('hidden');
+        }
+
+        async function signup() {
+            const username = document.getElementById('signup-username').value;
+            const email = document.getElementById('signup-email').value;
+            const password = document.getElementById('signup-password').value;
+
+            const res = await fetch('/signup', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, email, password })
+            });
+            const data = await res.json();
+            if (res.ok) {
+                showMessage('Signup success! Please login.', 'success');
+                toggleForms();
+            } else {
+                showMessage('Signup failed: ' + data.detail, 'error');
+            }
+        }
+
+        async function login() {
+            const username = document.getElementById('login-username').value;
+            const password = document.getElementById('login-password').value;
+
+            const res = await fetch('/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password })
+            });
+            const data = await res.json();
+            if (res.ok) {
+                accessToken = data.access_token;
+                refreshTkn = data.refresh_token;
+                document.getElementById('auth-section').classList.add('hidden');
+                document.getElementById('user-section').classList.remove('hidden');
+                document.getElementById('display-username').innerText = username;
+                showMessage('Login success!', 'success');
+            } else {
+                showMessage('Login failed: ' + data.detail, 'error');
+            }
+        }
+
+        async function getMe() {
+            const res = await fetch('/me', {
+                headers: { 'Authorization': 'Bearer ' + accessToken }
+            });
+            const data = await res.json();
+            if (res.ok) {
+                document.getElementById('display-userid').innerText = data.user_id;
+                showMessage('My info: ' + JSON.stringify(data), 'success');
+            } else {
+                showMessage('Failed to get info: ' + data.detail, 'error');
+            }
+        }
+
+        async function refreshToken() {
+            const res = await fetch('/refresh', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ refresh_token: refreshTkn })
+            });
+            const data = await res.json();
+            if (res.ok) {
+                accessToken = data.access_token;
+                refreshTkn = data.refresh_token;
+                showMessage('Token refreshed!', 'success');
+            } else {
+                showMessage('Refresh failed: ' + data.detail, 'error');
+            }
+        }
+
+        async function logout() {
+            const res = await fetch('/logout', {
+                method: 'POST',
+                headers: { 'Authorization': 'Bearer ' + accessToken }
+            });
+            if (res.ok) {
+                accessToken = '';
+                refreshTkn = '';
+                document.getElementById('auth-section').classList.remove('hidden');
+                document.getElementById('user-section').classList.add('hidden');
+                showMessage('Logged out.', 'success');
+            } else {
+                const data = await res.json();
+                showMessage('Logout failed: ' + data.detail, 'error');
+            }
+        }
+    </script>
+</body>
+</html>
