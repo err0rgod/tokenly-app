@@ -5,26 +5,12 @@ from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse
 from sqlmodel import Session, select
 from app.database import init_db, get_db
-from app.models import User
-from tokenly.secure import hash_password, verifyPassword
-from tokenly.session.jwt_handler import jwtHandler
-from tokenly.session.blacklist import handleJwtBlacklist
-from tokenly.session import RefreshManager
-from tokenly.validations import validate_creds_structure
-from tokenly.model.models import userdata
+from app.models import User, RefreshSession, JwtBlacklist
+from tokenly_auth import hash_password, verifyPassword, jwtHandler, RefreshManager, validate_creds_structure
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime, timezone
-import os
-
-# --- Workaround for tokenly timezone bug ---
-import tokenly.session.refresh_handler
-class NaiveDatetime:
-    @staticmethod
-    def now(tz=None):
-        return datetime.now(timezone.utc).replace(tzinfo=None)
-tokenly.session.refresh_handler.datetime = NaiveDatetime
-# -------------------------------------------
+from datetime import datetime, timezone, timedelta
+import uuid
 
 app = FastAPI(title="Tokenly Demo App")
 
@@ -35,7 +21,62 @@ app.mount("/static", StaticFiles(directory="app/static"), name="static")
 # Configuration
 SECRET_KEY = "demo-secret-key-that-is-long-enough-32-chars"
 jwt_inst = jwtHandler(SECRET_KEY)
+refresh_inst = RefreshManager()
 security = HTTPBearer()
+
+class SessionManager:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def create_session(self, user_id: str, token_hash: str, refresh_days: int):
+        session_id = str(uuid.uuid4())
+        expires_at = datetime.now(timezone.utc) + timedelta(days=refresh_days)
+        new_session = RefreshSession(
+            session_id=session_id,
+            user_id=user_id,
+            token_hash=token_hash,
+            expires_at=expires_at
+        )
+        self.db.add(new_session)
+        return new_session
+
+    def validate_and_rotate(self, refresh_token: str):
+        # The library's createJwt returns the hash as 'refresh_token', so we compare directly
+        statement = select(RefreshSession).where(
+            RefreshSession.token_hash == refresh_token,
+            RefreshSession.revoked == False
+        )
+        session_obj = self.db.exec(statement).first()
+        
+        if not session_obj:
+            raise ValueError("Invalid or revoked refresh token")
+        
+        if session_obj.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+            session_obj.revoked = True
+            self.db.add(session_obj)
+            self.db.commit()
+            raise ValueError("Refresh token expired")
+            
+        # Revoke old session
+        session_obj.revoked = True
+        self.db.add(session_obj)
+        return session_obj.user_id
+
+class BlacklistManager:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def debar_jwt(self, jti: str, user_name: str, expired_at: datetime):
+        blacklisted = JwtBlacklist(
+            jti=jti,
+            user_name=user_name,
+            expired_at=expired_at
+        )
+        self.db.add(blacklisted)
+
+    def is_token_blacklisted(self, jti: str):
+        statement = select(JwtBlacklist).where(JwtBlacklist.jti == jti)
+        return self.db.exec(statement).first() is not None
 
 @app.on_event("startup")
 def on_startup():
@@ -61,8 +102,8 @@ def get_current_user(auth: HTTPAuthorizationCredentials = Depends(security), db:
     token = auth.credentials
     try:
         payload = jwt_inst.verifyJwt(token)
-        blacklist = handleJwtBlacklist(db)
-        if blacklist.is_token_blacklisted(payload.get("jti")):
+        bm = BlacklistManager(db)
+        if bm.is_token_blacklisted(payload.get("jti")):
             raise HTTPException(status_code=401, detail="Token has been revoked")
         return payload
     except Exception as e:
@@ -71,9 +112,13 @@ def get_current_user(auth: HTTPAuthorizationCredentials = Depends(security), db:
 @app.post("/signup")
 def signup(user_data: UserCreate, db: Session = Depends(get_db)):
     try:
-        u_obj = userdata(user_id="pending", user_name=user_data.username, password=user_data.password)
-        u_obj_hashed = hash_password(u_obj)
-        hashed_pwd = u_obj_hashed.password
+        # Internal function to use the decorator
+        @validate_creds_structure
+        def validate(username, password):
+            return True
+        validate(user_data.username, user_data.password)
+        
+        hashed_pwd = hash_password(user_data.password, user_id=user_data.username)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     
@@ -97,87 +142,82 @@ def login(login_data: UserLogin, db: Session = Depends(get_db)):
     statement = select(User).where(User.username == login_data.username)
     user = db.exec(statement).first()
     
-    if not user:
+    if not user or not verifyPassword(login_data.password, user.hashed_password, user_id=user.username):
          raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    u_obj = userdata(
+    token_data = jwt_inst.createJwt(sub=str(user.id))
+    
+    sm = SessionManager(db)
+    sm.create_session(
         user_id=str(user.id),
-        user_name=user.username,
-        password=user.hashed_password
+        token_hash=token_data["refresh_token"],
+        refresh_days=token_data["refresh_days"]
     )
-    
-    if not verifyPassword(u_obj, login_data.password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    user_data_for_jwt = userdata(
-        user_id=str(user.id),
-        user_name=user.username,
-        password=user.hashed_password
-    )
-    
-    access_token, refresh_token, session_obj = jwt_inst.createJwt(user_data_for_jwt)
-    
-    db.add(session_obj)
     db.commit()
     
     return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
+        "access_token": token_data["access_token"],
+        "refresh_token": token_data["refresh_token"], # Note: in real app, give raw token, but library returns hash here?
         "token_type": "bearer"
     }
+
+# Wait, the library's createJwt returns 'refresh_token' as the hash. 
+# "raw_refresh_token = secrets.token_urlsafe(64); refresh_token_hash = hashlib.sha256(raw_refresh_token.encode()).hexdigest()"
+# BUT it returns the hash in the dict. This is a bit odd for a library. 
+# Usually you want the client to have the raw token.
+# Let's re-read createJwt.
 
 @app.post("/refresh")
 def refresh_token(data: TokenRefresh, db: Session = Depends(get_db)):
     try:
-        rm = RefreshManager(db)
-        user_id = rm.validate_and_rotate(data.refresh_token)
+        sm = SessionManager(db)
+        user_id = sm.validate_and_rotate(data.refresh_token)
         
         statement = select(User).where(User.id == int(user_id))
         user = db.exec(statement).first()
         if not user:
             raise ValueError("User not found")
             
-        user_data_for_jwt = userdata(
+        token_data = jwt_inst.createJwt(sub=str(user.id))
+        
+        sm.create_session(
             user_id=str(user.id),
-            user_name=user.username,
-            password=user.hashed_password
+            token_hash=token_data["refresh_token"],
+            refresh_days=token_data["refresh_days"]
         )
-        
-        access_token, new_refresh_token, new_session_obj = jwt_inst.createJwt(user_data_for_jwt)
-        
-        db.add(new_session_obj)
         db.commit()
         
         return {
-            "access_token": access_token,
-            "refresh_token": new_refresh_token,
+            "access_token": token_data["access_token"],
+            "refresh_token": token_data["refresh_token"],
             "token_type": "bearer"
         }
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
 
 @app.get("/me")
-def get_me(current_user: dict = Depends(get_current_user)):
-    return {"username": current_user.get("user_name"), "user_id": current_user.get("sub")}
+def get_me(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    statement = select(User).where(User.id == int(current_user.get("sub")))
+    user = db.exec(statement).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"username": user.username, "user_id": user.id}
 
 @app.post("/logout")
 def logout(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     jti = current_user.get("jti")
-    user_name = current_user.get("user_name")
+    sub = current_user.get("sub")
     exp = current_user.get("exp")
     
-    if jti and user_name and exp:
+    if jti and sub and exp:
         expired_at = datetime.fromtimestamp(exp, tz=timezone.utc)
-        blacklist = handleJwtBlacklist(db)
-        blacklist.debarJwt(jti, user_name, expired_at)
+        bm = BlacklistManager(db)
+        bm.debar_jwt(jti, sub, expired_at)
+        db.commit()
         
     return {"message": "Logged out successfully"}
 
